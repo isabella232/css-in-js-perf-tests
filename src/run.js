@@ -80,7 +80,7 @@ export const runBrowser = (testName, cases) => {
 
         // Run each of the browser tests sequentially
         return Object.keys(cases)
-            .map(caseName => runBrowserTest(testName.replace(/ /, '-'), toKebabCase(caseName)))
+            .map(caseName => runBrowserTest(testName.replace(/ /, '-'), toKebabCase(caseName), process.env.RUNS))
             .reduce((p, fn) => p.then((data) => {
                 if (data) {
                     testCases[toKebabCase(data.caseName)] = data.result;
@@ -101,81 +101,105 @@ export const runBrowser = (testName, cases) => {
     });
 };
 
-const runBrowserTest = (testName, caseName) => () => {
+const runBrowserTest = (testName, caseName, maxRuns = 1) => () => {
     var url = `http://localhost:8123/${testName}/${caseName}.html`;
-    const traceCategories = ['blink.console', 'devtools.timeline', 'disabled-by-default-devtools.timeline', 'toplevel', 'disabled-by-default-devtools.timeline.frame', 'benchmark'];
-
     console.log(`Running ${url}`);
 
-    let browser = wd.promiseRemote('http://localhost:9515');
-    let chromeCapabilities = {
+    const traceCategories = ['blink.console', 'devtools.timeline', 'disabled-by-default-devtools.timeline', 'toplevel', 'disabled-by-default-devtools.timeline.frame', 'benchmark'];
+    const chromeCapabilities = {
         browserName: 'chrome',
         chromeOptions: { perfLoggingPrefs: { traceCategories: traceCategories.join() } },
         loggingPrefs: { performance: "ALL" }
-    }
-    return browser.init(chromeCapabilities)
-        .then(() => browser.get(url))
-        .then(() => browser.sleep(1000))
-        .then(() => browser.log('performance'))
-        .then(logs => {
-            let eventStacks = {};
+    };
+    const traceCategoriesRegEx = new RegExp('\\b(' + traceCategories.join('|') + '|__metadata)\\b');
+    const eventCategories = {
+        loading: ['ParseAuthorStyleSheet', 'ParseHTML', 'ResourceFinish', 'ResourceReceivedData', 'ResourceReceiveResponse', 'ResourceSendRequest'],
+        painting: ['UpdateLayer', 'CompositeLayers', 'DecodeImage', 'MarkFirstPaint', 'Paint', 'PaintImage', 'PaintSetup', 'RasterTask', 'ResizeImage'],
+        other: ['Program', 'Task'],
+        rendering: ['Animation', 'BeginFrame', 'BeginMainThreadFrame', 'DrawFrame', 'HitTest', 'InvalidateLayout', 'Layout', 'RecalculateStyles', 'RequestMainThreadFrame', 'ScheduleStyleRecalculation', 'ScrollLayer', 'UpdateLayerTree', 'UpdateLayoutTree'],
+        scripting: ['CancelAnimationFrame', 'CancelIdleCallback', 'CompileScript', 'ConsoleTime', 'EmbedderCallback', 'EvaluateScript', 'EventDispatch', 'FireAnimationFrame', 'FireIdleCallback', 'FunctionCall', 'GCCollectGarbage', 'GCCompleteSweep', 'GCEvent', 'GCIdleLazySweep', 'JSFrame', 'LatencyInfo', 'MajorGC', 'MarkDOMContent', 'MarkLoad', 'MinorGC', 'ParseScriptOnBackground', 'RequestAnimationFrame', 'RequestIdleCallback', 'RunMicrotasks', 'TimerFire', 'TimerInstall', 'TimerRemove', 'TimeStamp', 'UserTiming', 'WebSocketCreate', 'WebSocketDestroy', 'WebSocketReceiveHandshakeResponse', 'WebSocketSendHandshakeRequest', 'XHRLoad', 'XHRReadyStateChange ']
+    };
 
-            let traceCategoriesRegEx = new RegExp('\\b(' + traceCategories.join('|') + '|__metadata)\\b');
 
-            let eventCategories = {
-                loading: ['ParseAuthorStyleSheet', 'ParseHTML', 'ResourceFinish', 'ResourceReceivedData', 'ResourceReceiveResponse', 'ResourceSendRequest'],
-                painting: ['UpdateLayer', 'CompositeLayers', 'DecodeImage', 'MarkFirstPaint', 'Paint', 'PaintImage', 'PaintSetup', 'RasterTask', 'ResizeImage'],
-                other: ['Program', 'Task'],
-                rendering: ['Animation', 'BeginFrame', 'BeginMainThreadFrame', 'DrawFrame', 'HitTest', 'InvalidateLayout', 'Layout', 'RecalculateStyles', 'RequestMainThreadFrame', 'ScheduleStyleRecalculation', 'ScrollLayer', 'UpdateLayerTree', 'UpdateLayoutTree'],
-                scripting: ['CancelAnimationFrame', 'CancelIdleCallback', 'CompileScript', 'ConsoleTime', 'EmbedderCallback', 'EvaluateScript', 'EventDispatch', 'FireAnimationFrame', 'FireIdleCallback', 'FunctionCall', 'GCCollectGarbage', 'GCCompleteSweep', 'GCEvent', 'GCIdleLazySweep', 'JSFrame', 'LatencyInfo', 'MajorGC', 'MarkDOMContent', 'MarkLoad', 'MinorGC', 'ParseScriptOnBackground', 'RequestAnimationFrame', 'RequestIdleCallback', 'RunMicrotasks', 'TimerFire', 'TimerInstall', 'TimerRemove', 'TimeStamp', 'UserTiming', 'WebSocketCreate', 'WebSocketDestroy', 'WebSocketReceiveHandshakeResponse', 'WebSocketSendHandshakeRequest', 'XHRLoad', 'XHRReadyStateChange ']
+    const processLogs = (logs) => {
+        let eventStacks = {};
+        let result = { loading: 0, painting: 0, other: 0, rendering: 0, scripting: 0 };
+
+        // FIXMe - make this efficient
+        const addEventToResult = (name, val) => {
+            for (var key in eventCategories) {
+                if (eventCategories[key].filter((a) => a === name).length === 1) {
+                    result[key] += (val / 1000);
+                    break;
+                }
             }
+        }
 
-            let result = {
-                loading: 0, painting: 0, other: 0, rendering: 0, scripting: 0
-            };
-
-            // FIXMe - make this efficient
-            const addEventToResult = (name, val) => {
-                for (var key in eventCategories) {
-                    if (eventCategories[key].filter((a) => a === name).length === 1) {
-                        result[key] += (val / 1000);
-                        break;
+        logs.forEach((log) => {
+            let msg = JSON.parse(log.message).message;
+            let result = {}
+            if (msg.method !== 'Tracing.dataCollected' || !traceCategoriesRegEx.test(msg.params.cat)) {
+                return;
+            }
+            let e = msg.params;
+            switch (e.ph) {
+                case 'I': // Instant Event
+                case 'X': // Duration Event
+                    addEventToResult(e.name, e.dur || e.tdur || 0);
+                    break;
+                case 'B': // Begin Event
+                    if (typeof eventStacks[e.tid] === 'undefined') {
+                        eventStacks[e.tid] = [];
                     }
-                }
+                    eventStacks[e.tid].push(e);
+                    break;
+                case 'E': // End Event
+                    if (typeof eventStacks[e.tid] === 'undefined' || eventStacks[e.tid].length === 0) {
+                        //console.log('Encountered an end event that did not have a start event', e);
+                    } else {
+                        var b = eventStacks[e.tid].pop();
+                        if (b.name !== e.name) {
+                            //console.log('Start and end events dont have the same name', e, b);
+                        }
+                        addEventToResult(e.name, e.ts - b.ts);
+                    }
+                    break;
             }
+        });
+        return result;
+    };
 
-            logs.forEach((log) => {
-                let msg = JSON.parse(log.message).message;
-                let result = {}
-                if (msg.method !== 'Tracing.dataCollected' || !traceCategoriesRegEx.test(msg.params.cat)) {
-                    return;
-                }
-                let e = msg.params;
-                switch (e.ph) {
-                    case 'I': // Instant Event
-                    case 'X': // Duration Event
-                        addEventToResult(e.name, e.dur || e.tdur || 0);
-                        break;
-                    case 'B': // Begin Event
-                        if (typeof eventStacks[e.tid] === 'undefined') {
-                            eventStacks[e.tid] = [];
+    const runTest = () => {
+        let browser = wd.promiseRemote('http://localhost:9515');
+        return browser.init(chromeCapabilities)
+            .then(() => browser.get(url))
+            .then(() => browser.sleep(1000))
+            .then(() => browser.log('performance'))
+            .then(processLogs)
+            .fin(() => browser.quit())
+    }
+
+    return new Promise((resolve, reject) => {
+        let results = [];
+        (function run(i) {
+            if (i < maxRuns) {
+                runTest().then(res => {
+                    results.push(res);
+                    run(i + 1);
+                }, reject);
+            } else {
+                resolve({
+                    caseName,
+                    result: results.reduce((prev, curr) => {
+                        for (var key in curr) {
+                            prev[key] = (prev[key] || 0) + curr[key] / maxRuns;
                         }
-                        eventStacks[e.tid].push(e);
-                        break;
-                    case 'E': // End Event
-                        if (typeof eventStacks[e.tid] === 'undefined' || eventStacks[e.tid].length === 0) {
-                            //console.log('Encountered an end event that did not have a start event', e);
-                        } else {
-                            var b = eventStacks[e.tid].pop();
-                            if (b.name !== e.name) {
-                                //console.log('Start and end events dont have the same name', e, b);
-                            }
-                            addEventToResult(e.name, e.ts - b.ts);
-                        }
-                        break;
-                }
-            });
-            return { caseName, result };
-        })
-        .fin(() => browser.quit())
+                        return prev;
+                    }, {})
+                });
+            }
+        } (0));
+    });
+
+
 };
